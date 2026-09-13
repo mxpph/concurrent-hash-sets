@@ -1,0 +1,11 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+ColumnLimit: 100
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReferenceAlignment: Left
+SortIncludes: true
+Cpp11BracedListStyle: false
+ReflowComments: false
+...
