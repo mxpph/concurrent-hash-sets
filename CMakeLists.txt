@@ -34,19 +34,61 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL Clang OR CMAKE_CXX_COMPILER_ID STREQUAL AppleC
           -Wno-unsafe-buffer-usage
           -Wno-thread-safety-negative
   )
-  set(USE_SANITIZER "" CACHE STRING
-          "Use the clang sanitizer [asan|tsan]")
-  if("${USE_SANITIZER}" STREQUAL "asan")
-    add_compile_options(-fsanitize=address -fno-omit-frame-pointer -fsanitize-address-use-after-scope)
-    add_link_options(-fsanitize=address -fno-omit-frame-pointer -fsanitize-address-use-after-scope)
-  elseif("${USE_SANITIZER}" STREQUAL "tsan")
-    add_compile_options(-fsanitize=thread)
-    add_link_options(-fsanitize=thread)
-  elseif(NOT "${USE_SANITIZER}" STREQUAL "")
-    message(FATAL_ERROR "Unknown argument to USE_SANITIZER: ${USE_SANITIZER} - options are [asan|tsan]")
+  # Clang-23 has new warnings that need suppressing: -Wlifetime-safety-...
+  #   -suggestions:  wants to annotate returned references with [[clang::lifetimebound]]
+  #   -invalidation:  false positive on reserve() in HashSetRefinable::BuildMutexPointers
+  include(CheckCXXCompilerFlag)
+  set(CMAKE_REQUIRED_FLAGS -Werror=unknown-warning-option)
+  check_cxx_compiler_flag(-Wlifetime-safety-suggestions HAVE_W_LIFETIME_SAFETY_SUGGESTIONS)
+  check_cxx_compiler_flag(-Wlifetime-safety-invalidation HAVE_W_LIFETIME_SAFETY_INVALIDATION)
+  unset(CMAKE_REQUIRED_FLAGS)
+  if(HAVE_W_LIFETIME_SAFETY_SUGGESTIONS)
+    add_compile_options(-Wno-lifetime-safety-suggestions)
   endif()
+  if(HAVE_W_LIFETIME_SAFETY_INVALIDATION)
+    add_compile_options(-Wno-lifetime-safety-invalidation)
+  endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
+  add_compile_options(-Werror -Wall -Wextra -pedantic)
+  add_compile_options(
+          -Wcast-align
+          -Wcast-qual
+          -Wconversion
+          -Wdouble-promotion
+          -Wduplicated-branches
+          -Wduplicated-cond
+          -Wextra-semi
+          -Wformat=2
+          -Wimplicit-fallthrough
+          -Wlogical-op
+          -Wmisleading-indentation
+          -Wnon-virtual-dtor
+          -Wnull-dereference
+          -Wold-style-cast
+          -Woverloaded-virtual
+          -Wshadow
+          -Wsign-conversion
+          -Wsuggest-override
+          -Wundef
+          -Wunused
+          -Wuseless-cast
+  )
+  # -Winterference-size warns about std::hardware_destructive_interference_size
+  add_compile_options(-Wno-interference-size)
 else()
-  message(FATAL_ERROR "The clang compiler is required")
+  message(FATAL_ERROR "The clang or GCC compiler is required")
+endif()
+
+set(USE_SANITIZER "" CACHE STRING
+        "Use the compiler sanitizer [asan|tsan]")
+if("${USE_SANITIZER}" STREQUAL "asan")
+  add_compile_options(-fsanitize=address -fno-omit-frame-pointer -fsanitize-address-use-after-scope)
+  add_link_options(-fsanitize=address -fno-omit-frame-pointer -fsanitize-address-use-after-scope)
+elseif("${USE_SANITIZER}" STREQUAL "tsan")
+  add_compile_options(-fsanitize=thread)
+  add_link_options(-fsanitize=thread)
+elseif(NOT "${USE_SANITIZER}" STREQUAL "")
+  message(FATAL_ERROR "Unknown argument to USE_SANITIZER: ${USE_SANITIZER} - options are [asan|tsan]")
 endif()
 
 add_executable(benchmarks

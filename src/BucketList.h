@@ -180,7 +180,7 @@ private:
 
   // Split-ordered hashing guarantees that new buckets follow the buckets that previously would
   // have contained their hash in the list, e.g. bucket 3 (mod 4), after resizing to 8, bucket 7
-  // = 3 (mod 4) would immediately preceed existing bucket 3. This ensures any thread doing a linear
+  // = 3 (mod 4) would immediately follow existing bucket 3. This ensures any thread doing a linear
   // scan from a hash using the previous capacity value will still find the element correctly.
   static std::size_t MakeOrdinaryKey(const T& elem) noexcept(kNothrowOnHash) {
     const std::size_t code{ Hash(elem) & kKeyMask };

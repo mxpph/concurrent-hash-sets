@@ -264,9 +264,9 @@ void RunScenario(benchmark::State& state, const Scenario& scenario) {
     if (step.operation == Operation::kContains) {
       benchmark::DoNotOptimize(hash_set.Contains(step.elem));
     } else if (step.operation == Operation::kAdd) {
-      thread_added += hash_set.Add(step.elem) ? 1 : 0;
+      thread_added += hash_set.Add(step.elem) ? 1U : 0U;
     } else {
-      thread_removed += hash_set.Remove(step.elem) ? 1 : 0;
+      thread_removed += hash_set.Remove(step.elem) ? 1U : 0U;
     }
   }
 
