@@ -4,12 +4,16 @@
 #include <emmintrin.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 #include "src/HashSetBase.h"
@@ -18,17 +22,9 @@
 template <typename T> class HashSetRefinable : public HashSetBase<T> {
 public:
   explicit HashSetRefinable(std::size_t initial_capacity)
-      : table_(std::max<std::size_t>(1, initial_capacity)), capacity_{ table_.size() } {
-    EnlargeMutexArena(table_.size());
-    mutex_ptrs_.store(BuildMutexPointers(table_.size()), std::memory_order_relaxed);
-  }
-
-  ~HashSetRefinable() override {
-    // Free all mutex pointers once we're done
-    for (auto* ptr : leaked_ptrs_) {
-      delete ptr;
-    }
-    delete mutex_ptrs_.load(std::memory_order_relaxed);
+      : initial_shift_{ ValidatedShift(initial_capacity) }, table_(initial_capacity),
+        capacity_{ initial_capacity } {
+    EnlargeMutexArena(0);
   }
 
   bool Add(T elem) final {
@@ -74,15 +70,15 @@ public:
 private:
   static constexpr std::size_t kLoadFactorNumerator{ 3 };
   static constexpr std::size_t kLoadFactorDenominator{ 4 };
-
-  using MutexPtrs = std::vector<detail::PaddedMutex*>;
+  static constexpr std::size_t kMaxBlocks{
+    static_cast<std::size_t>(std::numeric_limits<std::size_t>::digits) + 1
+  };
 
   // A mutex arena is formed by a collection of contiguous blocks of mutexes to reduce allocation
-  // overhead. When new mutexes are needed, a new block is allocated and appended to the arena.
-  struct MutexBlock {
-    std::unique_ptr<detail::PaddedMutex[]> mutexes;
-    std::size_t count{ 0 };
-  };
+  // overhead. Each resize appends one block, holding the mutexes for the buckets that the resize
+  // adds. Blocks are never moved or freed while the set is alive, so a thread may hold a mutex
+  // across a resize, and the mutex for a bucket is fixed for the lifetime of the set.
+  using MutexBlock = std::unique_ptr<detail::PaddedMutex[]>;
 
   // RAII class for handling the refinable locking logic
   class RefinableScopedLock {
@@ -97,17 +93,16 @@ private:
           _mm_pause();
           _mm_pause();
         }
-        // Atomically load the mutex ptrs, because another thread could resize the hash set while we
-        // are in this section of the code, which would cause a data race otherwise.
-        MutexPtrs* mutex_ptrs{ parent.mutex_ptrs_.load(std::memory_order_relaxed) };
-        const std::size_t old_capacity{ parent.capacity_.load(std::memory_order_relaxed) };
+        // Acquire synchronises with the release order when the new capacity is published
+        const std::size_t old_capacity{ parent.capacity_.load(std::memory_order_acquire) };
         hash = std::hash<T>()(elem) % old_capacity;
-        elem_lock_ = &(*mutex_ptrs)[hash]->mutex;
+        elem_lock_ = &parent.GetMutex(hash);
         elem_lock_->lock();
-        // If another thread didn't start resizing, or complete resizing and reallocate the
-        // mutex_ptrs during this section, we can return.
+        // The mutex for a bucket never changes, so Resize() only invalidates `hash`.
+        // If no thread started resizing, or completed a resize during this section of the code, our
+        // hash is still the one this capacity gives, and thus we hold the right mutex.
         if (!parent.resizing_.load(std::memory_order_acquire) &&
-            parent.mutex_ptrs_.load(std::memory_order_relaxed) == mutex_ptrs) {
+            parent.capacity_.load(std::memory_order_relaxed) == old_capacity) {
           return;
         }
         // Otherwise, we must retry.
@@ -125,11 +120,20 @@ private:
     std::mutex* elem_lock_{ nullptr };
   };
 
-  std::vector<MutexBlock> arena_;
-  std::vector<MutexPtrs*> leaked_ptrs_;
+  [[nodiscard]] static std::size_t ValidatedShift(std::size_t initial_capacity) {
+    if (initial_capacity < 2) {
+      throw std::invalid_argument("initial capacity must be at least two");
+    }
+    if ((initial_capacity - 1) & initial_capacity) {
+      throw std::invalid_argument("initial capacity must be a power of two");
+    }
+    return static_cast<std::size_t>(std::countr_zero(initial_capacity));
+  }
+
+  std::array<MutexBlock, kMaxBlocks> arena_{};
+  const std::size_t initial_shift_;
 
   // Aligned to cacheline size to prevent false sharing
-  alignas(detail::kAlignment) std::atomic<MutexPtrs*> mutex_ptrs_;
   alignas(detail::kAlignment) std::vector<std::vector<T>> table_;
   alignas(detail::kAlignment) std::atomic<std::size_t> capacity_;
   alignas(detail::kAlignment) std::atomic<bool> resizing_{ false };
@@ -155,13 +159,12 @@ private:
         resizing_.store(false, std::memory_order_relaxed);
         return;
       }
-      auto* old_mutex_ptrs{ mutex_ptrs_.load(std::memory_order_relaxed) };
-      Quiesce(old_mutex_ptrs);
       // Relaxed memory order is okay here because synchronisation is already guaranteed by the
-      // resizing_ atomic bool being true and Quiesce finished
+      // resizing_ atomic bool being true
       const std::size_t old_capacity{ capacity_.load(std::memory_order_relaxed) };
+      Quiesce(old_capacity);
       const std::size_t new_capacity{ 2 * old_capacity };
-      EnlargeMutexArena(new_capacity - old_capacity);
+      EnlargeMutexArena(BlockIndex(old_capacity));
       std::vector<std::vector<T>> new_table(new_capacity);
       for (auto& bucket : table_) {
         for (auto& elem : bucket) {
@@ -170,13 +173,9 @@ private:
         }
       }
 
-      auto* new_mutex_ptrs{ BuildMutexPointers(new_capacity) };
-      // We cannot immediately free the old mutex pointers. This is essential to the soundness of
-      // the algorithm, because we cannot be sure how many threads have still loaded the old pointer
-      // and are attempting to lock a bucket.
-      leaked_ptrs_.push_back(old_mutex_ptrs);
-      capacity_.store(new_capacity, std::memory_order_relaxed);
-      mutex_ptrs_.store(new_mutex_ptrs, std::memory_order_relaxed);
+      // This has to be release to ensure that the write to the new block is visible if a thread
+      // reads the new capacity then hashes and accesses it before resizing_ is changed.
+      capacity_.store(new_capacity, std::memory_order_release);
       table_ = std::move(new_table);
       // This has to be release to ensure that the write to table_ is visible in acquire once
       // resizing_ is changed to false causing the spin to end.
@@ -186,30 +185,37 @@ private:
 
   // Ensure that no other thread is in the middle of an Add(), Remove(), or Contains() call by
   // acquiring and immediately releasing all the mutexes.
-  void Quiesce(MutexPtrs* mutex_ptrs) {
-    for (auto* stripe : *mutex_ptrs) {
-      const std::scoped_lock<std::mutex> lock{ stripe->mutex };
+  void Quiesce(std::size_t capacity) {
+    for (std::size_t index{ 0 }; index < capacity; ++index) {
+      const std::scoped_lock<std::mutex> lock{ GetMutex(index) };
     }
   }
 
-  void EnlargeMutexArena(std::size_t count) {
-    arena_.push_back(MutexBlock{ std::make_unique<detail::PaddedMutex[]>(count), count });
+  void EnlargeMutexArena(std::size_t block_index) {
+    assert(arena_[block_index] == nullptr && "a block is only allocated once");
+    arena_[block_index] = std::make_unique<detail::PaddedMutex[]>(BlockSize(block_index));
   }
 
-  // Build a new table of pointers to the lock. This is done instead of resizing the existing one,
-  // which could potentially cause a move of all the elements in memory if contiguous allocation was
-  // not possible, causing a race condition in the acquire function in between load()ing the pointer
-  // and accessing the underlying mutex, which would segfault in such a case.
-  [[nodiscard]] MutexPtrs* BuildMutexPointers(std::size_t capacity) const noexcept {
-    auto* mutex_ptrs{ new MutexPtrs };
-    mutex_ptrs->reserve(capacity);
-    for (const auto& block : arena_) {
-      for (std::size_t i{ 0 }; i < block.count; ++i) {
-        mutex_ptrs->push_back(&block.mutexes[i]);
-      }
-    }
-    assert(mutex_ptrs->size() == capacity && "blocks must contain the whole capacity");
-    return mutex_ptrs;
+  [[nodiscard]] std::size_t BlockIndex(std::size_t index) const noexcept {
+    return static_cast<std::size_t>(std::bit_width(index >> initial_shift_));
+  }
+
+  [[nodiscard]] std::size_t BlockOffset(std::size_t index) const noexcept {
+    return index - (std::bit_floor(index >> initial_shift_) << initial_shift_);
+  }
+
+  // Blocks grow in powers of two
+  [[nodiscard]] std::size_t BlockSize(std::size_t block_index) const noexcept {
+    return std::size_t{ 1 } << (block_index == 0 ? initial_shift_
+                                                 : initial_shift_ + block_index - 1);
+  }
+
+  [[nodiscard]] std::mutex& GetMutex(std::size_t index) const noexcept {
+    const std::size_t block_index{ BlockIndex(index) };
+    const std::size_t offset{ BlockOffset(index) };
+    assert(arena_[block_index] != nullptr && "the block must be allocated before it is locked");
+    assert(offset < BlockSize(block_index) && "the offset must fall inside the block");
+    return arena_[block_index][offset].mutex;
   }
 
   // Called only while holding lock
