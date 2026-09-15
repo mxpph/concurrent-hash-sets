@@ -16,6 +16,8 @@
 template <typename T> class HashSetLockFree : public HashSetBase<T> {
 private:
   using SentinelPtr = typename BucketList<T>::SentinelPtr;
+  using Reclaimer = typename BucketList<T>::Reclaimer;
+  using Guard = typename BucketList<T>::Guard;
 
 public:
   explicit HashSetLockFree(std::size_t initial_capacity = kDefaultInitialCapacity,
@@ -37,7 +39,8 @@ public:
       throw std::invalid_argument("bucket index must fit in the sentinel key space");
     }
     buckets_ = std::make_unique<std::atomic<SentinelPtr>[]>(max_capacity);
-    buckets_[0].store(BucketList<T>::MakeRoot().GetHead(), std::memory_order_relaxed);
+    Guard guard{ reclaimer_ };
+    buckets_[0].store(BucketList<T>::MakeRoot(guard).GetHead(), std::memory_order_relaxed);
   }
 
   HashSetLockFree(const HashSetLockFree&) = delete;
@@ -45,14 +48,17 @@ public:
   HashSetLockFree(HashSetLockFree&&) = delete;
   HashSetLockFree& operator=(HashSetLockFree&&) = delete;
 
+  // Frees the nodes that are still linked in; the reclaimer then frees the ones that were removed
+  // but not yet reclaimed. Both are only safe once every thread has finished with the set.
   ~HashSetLockFree() override {
     BucketList<T>::Destroy(buckets_[0].load(std::memory_order_relaxed));
   }
 
   bool Add(T elem) final {
+    Guard guard{ reclaimer_ };
     std::size_t current_capacity{ capacity_.load(std::memory_order_relaxed) };
     std::size_t bucket_index{ BucketList<T>::Hash(elem) % current_capacity };
-    BucketList<T> bucket{ GetBucketList(bucket_index) };
+    BucketList<T> bucket{ GetBucketList(bucket_index, guard) };
     if (!bucket.Add(elem)) {
       return false;
     }
@@ -62,9 +68,10 @@ public:
   }
 
   bool Remove(T elem) final {
+    Guard guard{ reclaimer_ };
     const std::size_t current_capacity{ capacity_.load(std::memory_order_relaxed) };
     const std::size_t bucket_index{ BucketList<T>::Hash(elem) % current_capacity };
-    BucketList<T> bucket{ GetBucketList(bucket_index) };
+    BucketList<T> bucket{ GetBucketList(bucket_index, guard) };
     if (!bucket.Remove(elem)) {
       return false;
     }
@@ -72,11 +79,12 @@ public:
     return true;
   }
 
-  // NOT Wait-free as GetBucketList can allocate.
+  // NOT Wait-free as it can cause allocations.
   [[nodiscard]] bool Contains(T elem) final {
+    Guard guard{ reclaimer_ };
     const std::size_t current_capacity{ capacity_.load(std::memory_order_relaxed) };
     const std::size_t bucket_index{ BucketList<T>::Hash(elem) % current_capacity };
-    BucketList<T> bucket{ GetBucketList(bucket_index) };
+    BucketList<T> bucket{ GetBucketList(bucket_index, guard) };
     return bucket.Contains(elem);
   }
 
@@ -91,6 +99,9 @@ private:
 
   alignas(kAlignment) std::unique_ptr<std::atomic<SentinelPtr>[]> buckets_;
   const std::size_t max_capacity_{ kDefaultMaxCapacity };
+
+  // Holds its own alignment, so it needs none here.
+  Reclaimer reclaimer_;
 
   // Aligned to cacheline size to prevent false sharing
   alignas(kAlignment) std::atomic<std::size_t> capacity_{ kDefaultInitialCapacity };
@@ -110,18 +121,18 @@ private:
     }
   }
 
-  BucketList<T> GetBucketList(std::size_t index) {
+  BucketList<T> GetBucketList(std::size_t index, Guard& guard) {
     assert(index < max_capacity_);
     SentinelPtr sentinel{ buckets_[index].load(std::memory_order_acquire) };
     if (sentinel == nullptr) {
-      sentinel = InitializeBucket(index);
+      sentinel = InitializeBucket(index, guard);
     }
-    return BucketList<T>::FromSentinel(sentinel);
+    return BucketList<T>::FromSentinel(sentinel, guard);
   }
 
-  SentinelPtr InitializeBucket(std::size_t index) {
+  SentinelPtr InitializeBucket(std::size_t index, Guard& guard) {
     assert(index != 0);
-    BucketList<T> parent{ GetBucketList(GetParentIndex(index)) };
+    BucketList<T> parent{ GetBucketList(GetParentIndex(index), guard) };
     const SentinelPtr sentinel{ parent.SentinelFor(index) };
     SentinelPtr expected{ nullptr };
     buckets_[index].compare_exchange_strong(expected, sentinel, std::memory_order_release,

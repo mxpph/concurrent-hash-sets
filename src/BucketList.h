@@ -9,6 +9,7 @@
 #include <limits>
 #include <type_traits>
 
+#include "src/EpochReclaimer.h"
 #include "src/MarkableReference.h"
 
 static_assert(std::atomic<uintptr_t>::is_always_lock_free,
@@ -36,12 +37,11 @@ namespace detail {
 // predecessor's pointer is what makes this safe: a concurrent Insert that tries to splice a new
 // node in after a marked node will see the mark and fail its CAS.
 //
-// Nodes are never reclaimed while the list is in use. Once a node has been unlinked another thread
-// may still be traversing it, and without a reclamation scheme there is no way to know when the
-// last such reference is gone. Removed nodes are therefore deliberately leaked. Destroy() frees the
+// An unlinked node is not deleted on the spot, because a thread that loaded a pointer to it
+// beforehand may still be traversing it. It is handed to an EpochReclaimer instead, which deletes
+// it once every thread that could be holding it has left the operation it was in, so every
+// operation on a list must be made inside a Guard taken on that same reclaimer. Destroy() frees the
 // nodes that are still linked in, which is only safe once every thread has finished.
-//
-// TODO: Introduce RCU / EBR / hazard pointers.
 template <typename T> class BucketList {
 private:
   struct Node;
@@ -50,16 +50,21 @@ private:
 
 public:
   using SentinelPtr = Node*;
+  using Reclaimer = EpochReclaimer<Node>;
+  using Guard = typename Reclaimer::Guard;
 
   static constexpr std::size_t kMaxBuckets = kKeyMask + 1;
 
-  static BucketList<T> MakeRoot() {
-    BucketList<T> list{ new Node{
-        .next{ MarkableReference<Node*>{ new Node{ .key{ kTailKey } }, false } } } };
+  static BucketList<T> MakeRoot(Guard& guard) {
+    BucketList<T> list{
+      new Node{ .next{ MarkableReference<Node*>{ new Node{ .key{ kTailKey } }, false } } }, guard
+    };
     return list;
   }
 
-  static BucketList<T> FromSentinel(SentinelPtr sentinel) { return BucketList<T>{ sentinel }; }
+  static BucketList<T> FromSentinel(SentinelPtr sentinel, Guard& guard) {
+    return BucketList<T>{ sentinel, guard };
+  }
 
   // Nothing here synchronises with anything: tearing down a list that another thread may still be
   // traversing is undefined.
@@ -106,16 +111,20 @@ public:
       Node* succ{ curr->next.Load(std::memory_order_acquire) };
       if (curr->next.AttemptMark(succ, true, std::memory_order_acq_rel)) {
         // Only attempt physical removal once, because another thread will remove the node
-        // otherwise.
-        pred->next.CompareAndSet(curr, false, succ, false, std::memory_order_acq_rel);
+        // otherwise. Whichever thread unlinks it is the one that retires it, so it is retired
+        // exactly once: a node's `next` pointer never changes again once it has been marked, so
+        // only one unlinking CAS can succeed.
+        if (pred->next.CompareAndSet(curr, false, succ, false, std::memory_order_acq_rel)) {
+          guard_.Retire(curr);
+        }
         return true;
       }
     }
   }
 
   // This function is wait-free because it doesn't physically remove any nodes. Traversing a marked
-  // node is safe because nodes are never reclaimed and every `next` pointer leads forwards, so
-  // traversal still ends at the tail sentinel.
+  // node is safe because a node is not deleted until every thread that could reach it has left its
+  // Guard, and every `next` pointer leads forwards, so traversal still ends at the tail sentinel.
   [[nodiscard]] bool Contains(const T& elem) const noexcept(kNothrowOnEquals && kNothrowOnHash) {
     assert(head_ != nullptr);
     const std::size_t key{ MakeOrdinaryKey(elem) };
@@ -199,10 +208,12 @@ private:
   }
 
   Node* head_{ nullptr };
+  Guard& guard_;
 
-  explicit BucketList(Node* head) : head_{ head } {}
+  BucketList(Node* head, Guard& guard) : head_{ head }, guard_{ guard } {}
 
-  Window Find(std::size_t key, const T* elem) noexcept(kNothrowOnEquals) {
+  // Not noexcept: retiring a node can allocate.
+  Window Find(std::size_t key, const T* elem) {
     assert(head_ != nullptr);
   find_retry:
     Node* pred{ head_ };
@@ -214,6 +225,7 @@ private:
         if (!pred->next.CompareAndSet(curr, false, succ, false, std::memory_order_acq_rel)) {
           goto find_retry;
         }
+        guard_.Retire(curr);
         curr = succ;
         succ = curr->next.Load(marked, std::memory_order_acquire);
       }
