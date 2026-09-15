@@ -74,8 +74,6 @@ public:
 
   static std::size_t Hash(const T& elem) noexcept(kNothrowOnHash) { return std::hash<T>()(elem); }
 
-  BucketList() = default;
-
   [[nodiscard]] SentinelPtr GetHead() const noexcept { return head_; }
 
   bool Add(const T& elem) {

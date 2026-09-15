@@ -27,6 +27,11 @@ public:
     }
   }
 
+  ScopedVectorLock(const ScopedVectorLock&) = delete;
+  ScopedVectorLock& operator=(const ScopedVectorLock&) = delete;
+  ScopedVectorLock(ScopedVectorLock&&) = delete;
+  ScopedVectorLock& operator=(ScopedVectorLock&&) = delete;
+
 private:
   std::vector<detail::PaddedMutex>& mutexes_;
 };

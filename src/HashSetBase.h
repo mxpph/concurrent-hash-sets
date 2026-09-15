@@ -18,6 +18,13 @@ public:
 
   // Returns the size of the hash set.
   [[nodiscard]] virtual size_t Size() const = 0;
+
+protected:
+  HashSetBase() = default;
+  HashSetBase(const HashSetBase&) = default;
+  HashSetBase& operator=(const HashSetBase&) = default;
+  HashSetBase(HashSetBase&&) = default;
+  HashSetBase& operator=(HashSetBase&&) = default;
 };
 
 #endif // HASH_SET_BASE_H

@@ -116,6 +116,11 @@ private:
     }
     ~RefinableScopedLock() { elem_lock_->unlock(); }
 
+    RefinableScopedLock(const RefinableScopedLock&) = delete;
+    RefinableScopedLock& operator=(const RefinableScopedLock&) = delete;
+    RefinableScopedLock(RefinableScopedLock&&) = delete;
+    RefinableScopedLock& operator=(RefinableScopedLock&&) = delete;
+
   private:
     std::mutex* elem_lock_{ nullptr };
   };

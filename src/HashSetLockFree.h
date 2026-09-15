@@ -40,6 +40,11 @@ public:
     buckets_[0].store(BucketList<T>::MakeRoot().GetHead(), std::memory_order_relaxed);
   }
 
+  HashSetLockFree(const HashSetLockFree&) = delete;
+  HashSetLockFree& operator=(const HashSetLockFree&) = delete;
+  HashSetLockFree(HashSetLockFree&&) = delete;
+  HashSetLockFree& operator=(HashSetLockFree&&) = delete;
+
   ~HashSetLockFree() override {
     BucketList<T>::Destroy(buckets_[0].load(std::memory_order_relaxed));
   }
