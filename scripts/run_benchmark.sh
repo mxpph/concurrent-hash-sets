@@ -17,11 +17,15 @@ case "${COMPILER}" in
     ;;
 esac
 
+# Set USE_BASELINES=ON to also benchmark against the oneTBB and libcds hash sets.
+USE_BASELINES="${USE_BASELINES:-OFF}"
+
 BUILD_DIR="build/${COMPILER}"
 cmake -G "Unix Makefiles" . -B "${BUILD_DIR}" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_COMPILER="${CXX_COMPILER}" \
-  -DCMAKE_CXX_FLAGS="${CXX_FLAGS}"
+  -DCMAKE_CXX_FLAGS="${CXX_FLAGS}" \
+  -DUSE_BASELINES="${USE_BASELINES}"
 cmake --build "${BUILD_DIR}" --config Release --target benchmarks --parallel
 
 taskset -c 0-15 "./${BUILD_DIR}/benchmarks" \

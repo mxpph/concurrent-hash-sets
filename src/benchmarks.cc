@@ -14,6 +14,11 @@
 #include "src/HashSetRefinable.h"
 #include "src/HashSetStriped.h"
 
+#ifdef USE_BASELINES
+#include "src/HashSetLibcds.h"
+#include "src/HashSetTbb.h"
+#endif
+
 namespace {
 
 enum class Operation { kContains, kAdd, kRemove };
@@ -39,7 +44,7 @@ struct Scenario {
   KeyChoice key_choice;
   std::size_t keys;
   std::size_t initial_capacity;
-  std::size_t max_capacity; // only the lock-free set uses this
+  std::size_t max_capacity; // only the lock-free and libcds sets use this
   std::size_t iterations;   // per thread
   bool prefill;
 };
@@ -212,10 +217,22 @@ bool check_failed_{ false };
 template <typename HashSetType> [[nodiscard]] HashSetType* MakeHashSet(const Scenario& scenario) {
   if constexpr (std::is_same_v<HashSetType, HashSetLockFree<std::size_t>>) {
     return new HashSetType{ scenario.initial_capacity, scenario.max_capacity };
+#ifdef USE_BASELINES
+  } else if constexpr (std::is_same_v<HashSetType, HashSetLibcds<std::size_t>>) {
+    return new HashSetType{ scenario.max_capacity };
+#endif
   } else {
     return new HashSetType{ scenario.initial_capacity };
   }
 }
+
+template <typename HashSetType> struct ThreadGuard {};
+
+#ifdef USE_BASELINES
+template <> struct ThreadGuard<HashSetLibcds<std::size_t>> {
+  detail::LibcdsGuard guard;
+};
+#endif
 
 template <typename HashSetType> void SetUpRun(const Scenario& scenario) {
   hash_set_under_test_<HashSetType> = MakeHashSet<HashSetType>(scenario);
@@ -249,6 +266,7 @@ template <typename HashSetType> void CheckRun(const benchmark::State& state) {
 
 template <typename HashSetType>
 void RunScenario(benchmark::State& state, const Scenario& scenario) {
+  [[maybe_unused]] const ThreadGuard<HashSetType> thread_guard;
   const std::vector<Step> steps{ BuildSteps(scenario,
                                             static_cast<std::size_t>(state.thread_index()),
                                             static_cast<std::size_t>(state.threads())) };
@@ -293,6 +311,10 @@ void RegisterAll() {
       Register<HashSetStriped<std::size_t>>(scenario, "striped", threads);
       Register<HashSetRefinable<std::size_t>>(scenario, "refinable", threads);
       Register<HashSetLockFree<std::size_t>>(scenario, "lock_free", threads);
+#ifdef USE_BASELINES
+      Register<HashSetTbb<std::size_t>>(scenario, "tbb_hash_map", threads);
+      Register<HashSetLibcds<std::size_t>>(scenario, "cds_split_list", threads);
+#endif
     }
   }
 }
@@ -305,6 +327,10 @@ int main(int argc, char** argv) {
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {
     return 1;
   }
+#ifdef USE_BASELINES
+  const detail::LibcdsReclaimer libcds_reclaimer;
+  const detail::LibcdsGuard libcds_guard;
+#endif
   RegisterAll();
   benchmark::RunSpecifiedBenchmarks();
   benchmark::Shutdown();

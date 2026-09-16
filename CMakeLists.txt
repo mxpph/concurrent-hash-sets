@@ -25,6 +25,49 @@ FetchContent_Declare(googlebenchmark
         SYSTEM)
 FetchContent_MakeAvailable(googlebenchmark)
 
+option(USE_BASELINES "Also benchmark against the oneTBB and libcds hash sets" OFF)
+if(USE_BASELINES)
+  set(TBB_TEST OFF)
+  set(TBB_EXAMPLES OFF)
+  set(TBB_STRICT OFF)
+  FetchContent_Declare(onetbb
+          GIT_REPOSITORY https://github.com/uxlfoundation/oneTBB.git
+          GIT_TAG v2022.3.0
+          SYSTEM)
+  FetchContent_MakeAvailable(onetbb)
+  # oneTBB's concurrent_queue.h calls std::equal without including <algorithm>, which libc++ no
+  # longer pulls in for it. Only oneTBB's own sources need the include; the headers we use do not.
+  target_compile_options(tbb PRIVATE -include algorithm)
+
+  # libcds is fetched but not configured: SOURCE_SUBDIR names a directory with no CMakeLists.txt,
+  # so FetchContent populates it and stops. Its own build asks for cmake 3.0.2, forces C++11 and
+  # produces a shared library plus tests, none of which is wanted, so the handful of sources Linux
+  # needs are built here instead, with the same standard and flags as everything else.
+  FetchContent_Declare(libcds
+          GIT_REPOSITORY https://github.com/khizmax/libcds.git
+          GIT_TAG 9985d2a87feaa3e92532e28f4ab762a82855a49c
+          SOURCE_SUBDIR src)
+  FetchContent_MakeAvailable(libcds)
+  add_library(cds STATIC
+          ${libcds_SOURCE_DIR}/src/dhp.cpp
+          ${libcds_SOURCE_DIR}/src/hp.cpp
+          ${libcds_SOURCE_DIR}/src/hp_thread_local.cpp
+          ${libcds_SOURCE_DIR}/src/init.cpp
+          ${libcds_SOURCE_DIR}/src/thread_data.cpp
+          ${libcds_SOURCE_DIR}/src/topology_linux.cpp
+          ${libcds_SOURCE_DIR}/src/urcu_gp.cpp
+          ${libcds_SOURCE_DIR}/src/urcu_sh.cpp)
+  target_include_directories(cds SYSTEM PUBLIC ${libcds_SOURCE_DIR})
+  target_link_libraries(cds PRIVATE Threads::Threads)
+  target_compile_options(cds PRIVATE -w)
+  target_compile_options(cds PUBLIC -mcx16)
+  include(CheckIncludeFileCXX)
+  check_include_file_cxx(linux/membarrier.h HAVE_LINUX_MEMBARRIER_H)
+  if(HAVE_LINUX_MEMBARRIER_H)
+    target_compile_definitions(cds PRIVATE CDS_HAVE_LINUX_MEMBARRIER_H)
+  endif()
+endif()
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL Clang OR CMAKE_CXX_COMPILER_ID STREQUAL AppleClang)
   add_compile_options(-Werror -Wall -Wextra -pedantic -Weverything)
   add_compile_options(
@@ -100,3 +143,11 @@ add_executable(benchmarks
         src/benchmarks.cc)
 target_include_directories(benchmarks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(benchmarks PRIVATE Threads::Threads benchmark::benchmark)
+
+if(USE_BASELINES)
+  target_sources(benchmarks PRIVATE
+          src/HashSetLibcds.h
+          src/HashSetTbb.h)
+  target_link_libraries(benchmarks PRIVATE TBB::tbb cds)
+  target_compile_definitions(benchmarks PRIVATE USE_BASELINES)
+endif()
